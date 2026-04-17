@@ -21,6 +21,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { spawn: spawnProcess } = require("child_process");
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -42,6 +43,7 @@ const LOG_FILE = path.join(STATE_DIR, "daemon.log");
 const PID_FILE = path.join(STATE_DIR, "daemon.pid");
 const PANIC_FILE = path.join(STATE_DIR, "PANIC");
 const SOCKET_PATH = process.env.WA_DAEMON_SOCKET || "/tmp/claude-wa.sock";
+const WORK_ROOT = process.env.WA_WORK_ROOT || path.join(os.homedir(), "Work");
 
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(INBOX_DIR, { recursive: true });
@@ -547,6 +549,134 @@ async function handleInbound(msg, jid, participant) {
       pendingPermissions.delete(request_id);
     }
     try { await sock.sendMessage(jid, { react: { text: behavior === "allow" ? "✅" : "❌", key: msg.key } }); } catch {}
+    return;
+  }
+
+  // Spawn-related commands:
+  //   !projects                       → list folders in WORK_ROOT
+  //   !spawn <name|path> [prompt]    → open Terminal.app + claude in that folder
+  //                                    (bare name is resolved against WORK_ROOT)
+  //   !new <name> [prompt]           → mkdir WORK_ROOT/<name> and spawn
+  const aplEsc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const openClaudeInFolder = (folder, initialPrompt) => {
+    const shellCmd = `cd "${aplEsc(folder)}" && claude --dangerously-skip-permissions`;
+    const osa = `tell application "Terminal" to do script "${aplEsc(shellCmd)}"`;
+    spawnProcess("osascript", ["-e", osa, "-e", 'tell application "Terminal" to activate'], {
+      stdio: "ignore", detached: true,
+    }).unref();
+    if (initialPrompt) {
+      setTimeout(() => {
+        const typeOsa = `tell application "System Events" to tell process "Terminal" to keystroke "${aplEsc(initialPrompt)}" & return`;
+        spawnProcess("osascript", ["-e", typeOsa], { stdio: "ignore" });
+      }, 4000);
+    }
+    log(`spawned Terminal.app window running claude in ${folder}`);
+  };
+  const listProjects = () => fs.readdirSync(WORK_ROOT, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+    .map((d) => d.name)
+    .sort();
+
+  const resolveFolder = (raw) => {
+    if (raw.startsWith("~")) return path.resolve(path.join(os.homedir(), raw.slice(1)));
+    if (raw.startsWith("/")) return path.resolve(raw);
+    if (/^\d+$/.test(raw)) {
+      const idx = parseInt(raw, 10) - 1;
+      const entries = listProjects();
+      if (idx < 0 || idx >= entries.length) return null;
+      return path.join(WORK_ROOT, entries[idx]);
+    }
+    return path.resolve(path.join(WORK_ROOT, raw));
+  };
+
+  if (/^!help\s*$/i.test(text) || /^!\?\s*$/.test(text)) {
+    const helpText = [
+      "📖 WhatsApp commands",
+      "",
+      "Routing (pick which terminal replies):",
+      "  <N> <msg>         send to session #N (1-99)",
+      "  #<tag> <msg>      send to session whose folder matches <tag>",
+      "  !all              ask every session for a one-line status",
+      "  !all <msg>        broadcast <msg> to every session",
+      "  (quote-reply)     replies route back to the session that sent the message",
+      "",
+      "Spawning new Claude sessions:",
+      "  !projects         list folders in " + WORK_ROOT,
+      "  !ls               alias for !projects",
+      "  !spawn <N|name>   open Terminal + claude in that folder",
+      "  !spawn <path>     absolute/~ path also accepted",
+      "  !spawn ... <msg>  trailing text becomes the first prompt",
+      "  !new <name>       mkdir " + WORK_ROOT + "/<name> and spawn",
+      "",
+      "Other:",
+      "  !help             this message",
+    ].join("\n");
+    try { await sock.sendMessage(jid, { text: helpText }); } catch (e) { log(`help send failed: ${e.message}`); }
+    return;
+  }
+
+  if (/^!projects\s*$/i.test(text) || /^!ls\s*$/i.test(text)) {
+    try {
+      const entries = listProjects();
+      const pad = String(entries.length).length;
+      const lines = [`📁 ${WORK_ROOT}`, ...entries.map((n, i) => `  ${String(i + 1).padStart(pad)}. ${n}`)];
+      if (!entries.length) lines.push("  (empty)");
+      lines.push("", "spawn: !spawn <N|name>    new: !new <name>");
+      await sock.sendMessage(jid, { text: lines.join("\n") });
+    } catch (e) {
+      await sock.sendMessage(jid, { text: `❌ ls failed: ${e.message}` });
+    }
+    return;
+  }
+
+  const newMatch = /^!new\s+(\S+)(?:\s+([\s\S]*))?$/i.exec(text);
+  if (newMatch) {
+    const name = newMatch[1];
+    const initialPrompt = (newMatch[2] || "").trim();
+    if (name.includes("/") || name === "." || name === "..") {
+      await sock.sendMessage(jid, { text: "❌ name must not contain / or be . / .." });
+      return;
+    }
+    const folder = path.join(WORK_ROOT, name);
+    try {
+      if (fs.existsSync(folder)) {
+        await sock.sendMessage(jid, { text: `❌ folder already exists: ${folder}\nuse !spawn ${name} to open it` });
+        return;
+      }
+      fs.mkdirSync(folder, { recursive: true });
+      openClaudeInFolder(folder, initialPrompt);
+      await sock.sendMessage(jid, { text: `✅ created ${folder} and spawned claude` });
+    } catch (e) {
+      log(`new failed: ${e.message}`);
+      await sock.sendMessage(jid, { text: `❌ new failed: ${e.message}` });
+    }
+    return;
+  }
+
+  const spawnMatch = /^!spawn\s+(\S+)(?:\s+([\s\S]*))?$/i.exec(text);
+  if (spawnMatch) {
+    const folder = resolveFolder(spawnMatch[1]);
+    const initialPrompt = (spawnMatch[2] || "").trim();
+    if (!folder) {
+      await sock.sendMessage(jid, { text: `❌ no project at index ${spawnMatch[1]} — try !projects` });
+      return;
+    }
+    try {
+      if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
+        await sock.sendMessage(jid, { text: `❌ folder not found: ${folder}` });
+        return;
+      }
+    } catch (e) {
+      await sock.sendMessage(jid, { text: `❌ folder check failed: ${e.message}` });
+      return;
+    }
+    try {
+      openClaudeInFolder(folder, initialPrompt);
+      await sock.sendMessage(jid, { text: `✅ spawned claude in ${folder}` });
+    } catch (e) {
+      log(`spawn failed: ${e.message}`);
+      await sock.sendMessage(jid, { text: `❌ spawn failed: ${e.message}` });
+    }
     return;
   }
 

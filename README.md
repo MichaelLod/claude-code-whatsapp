@@ -46,6 +46,21 @@ In practice, path (2) is what wakes idle sessions reliably today. Message conten
 
 If nothing matches, the daemon reacts with ❓ on the phone and drops.
 
+## Phone commands
+
+Commands handled by the daemon directly (no Claude turn required):
+
+| Command              | Effect                                                                        |
+|----------------------|-------------------------------------------------------------------------------|
+| `!help` / `!?`       | List all routing and phone commands                                           |
+| `!projects` / `!ls`  | List folders in `$WA_WORK_ROOT` (defaults to `~/Work`), numbered              |
+| `!spawn <N\|name>`   | Open `Terminal.app` and run `claude` in that folder (index or bare name)      |
+| `!spawn <path>`      | Absolute or `~`-prefixed path also accepted                                   |
+| `!spawn ... <msg>`   | Trailing text is typed into the new terminal as the first prompt (4s delay)   |
+| `!new <name>`        | `mkdir $WA_WORK_ROOT/<name>` and spawn `claude` in it                         |
+
+Override the project root with `WA_WORK_ROOT=/some/path` in the daemon's env (the launchd plist is a good place).
+
 ## Setup
 
 ### 1. Install
