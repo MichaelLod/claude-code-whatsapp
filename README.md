@@ -1,186 +1,209 @@
-# WhatsApp Channel for Claude Code
+# Multi-Session WhatsApp Channel for Claude Code
 
-A custom [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels) plugin that adds WhatsApp as a messaging channel, using [Baileys](https://github.com/WhiskeySockets/Baileys) v7 (WhatsApp Web Multi-Device protocol).
+One WhatsApp line, many Claude Code terminals. Route replies to the right project by `[tag]` prefix, `#tag` address, `!all` broadcast, or quote-reply — all through a single WhatsApp linked-device slot.
 
-> **Note:** This is a personal project that I've open-sourced for the community. It works for my 24/7 setup and I'm sharing it as-is. PRs are welcome.
+A fork of [`diogo85/claude-code-whatsapp`](https://github.com/diogo85/claude-code-whatsapp), split into a persistent daemon plus a thin per-session MCP client.
+
+> **Why a fork?** WhatsApp caps linked devices at 4. Running upstream's single-session plugin in more than a couple of Claude terminals at once knocks older sessions offline. This fork keeps one Baileys connection in a daemon and fans messages out to N Claude sessions over a local Unix socket.
 
 ## How it works
 
 ```
-WhatsApp (phone)
-    ↕ Baileys v7.0.0-rc.9 (Multi-Device protocol)
-server.cjs (MCP server with channel + permission relay capabilities)
-    ↕ notifications/claude/channel
-Claude Code (receives and responds to WhatsApp messages)
+Phone (WhatsApp)
+    ↕  WhatsApp Web Multi-Device (Baileys v7)
+wa-daemon.cjs          ← persistent, single connection, managed by launchd
+    ↕  /tmp/claude-wa.sock (JSON-line IPC)
+session-client.cjs     ← thin MCP stdio subprocess, one per Claude session
+    ↕  notifications/claude/channel
+Claude Code            ← e.g. in ~/Work/polybillionaire or ~/Work/lodzik-cv
 ```
 
-The plugin runs as an MCP server that connects to WhatsApp via Baileys, receives incoming messages, and pushes them to Claude Code as channel notifications. Claude can reply using the `reply` tool.
+## Routing model
 
-## Features (v0.0.3)
+**Outbound (Claude → phone).** Every reply is auto-prefixed with `[${basename(cwd)}]` so the phone can tell sessions apart: `[polybillionaire] bot stopped out SOL`. Pass `prefix: false` to the `reply` tool to skip the tag.
 
-- **Production-grade stability** — connection patterns based on [OpenClaw](https://github.com/openclaw/openclaw)'s proven WhatsApp gateway
-- **515 is normal** — WhatsApp restart requests are handled gracefully (reconnect in 2s, not crash)
-- **Never crashes the process** — only stops on 440 (conflict) or 401 (logout); everything else reconnects
-- **Exponential backoff with jitter** — factor 1.8, jitter 25%, max 30s, reset after healthy period
-- **Watchdog** — detects stale connections (30min timeout) and forces reconnect
-- **Credential backup** — auto-backup before each save, auto-restore if corrupted
-- **Permission relay** — approve Claude Code tool use from your phone ("yes xxxxx" / "no xxxxx")
-- **getMessage handler** — required for E2EE retry in Baileys v7
-- **Crypto error recovery** — Baileys crypto errors trigger reconnect instead of crash
-- **Graceful shutdown** — clean exit on SIGTERM/SIGINT/stdin close
+**Inbound (phone → Claude).** The daemon classifies each incoming message in this order:
 
-## Requirements
+| Prefix                              | Routes to                                      |
+|-------------------------------------|------------------------------------------------|
+| `#<tag> <message>`                  | session(s) whose tag matches (prefix, case-insensitive) |
+| `!all <message>`                    | every registered session                       |
+| *(quote-reply to tagged outbound)*  | session that sent the quoted message           |
+| *(none of the above)*               | the **active** session (most recent `/connect-wa`) |
 
-- **Node.js** 20+ (Bun is NOT supported — lacks WebSocket events Baileys needs)
-- **Claude Code** 2.1.80+ (with Channels support)
-- **WhatsApp** account (regular or Business)
+If nothing matches, the daemon reacts with ❓ on the phone and drops.
 
-## Quick Start
+## Setup
 
-### 1. Clone and install
+### 1. Install
 
 ```bash
-git clone https://github.com/diogo85/claude-code-whatsapp.git
-cd claude-code-whatsapp
+git clone <this fork's URL> ~/Work/claude-whatsapp-mcp
+cd ~/Work/claude-whatsapp-mcp
 npm install
 ```
 
-### 2. Configure MCP server
+Node 20+ required. Bun is not supported (Baileys depends on Node WebSocket events Bun doesn't emit).
 
-Add to your project's `.mcp.json`:
+### 2. Pair your WhatsApp account once
+
+```bash
+mkdir -p ~/.claude/channels/whatsapp/auth
+WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp npm run pair
+# Scan the QR on your phone at WhatsApp > Linked Devices > Link a Device
+# (Alternative: PAIR_PHONE=<E.164 number> for pairing-code flow)
+```
+
+Wait for `✅ WhatsApp connected!`. Auth creds land in `~/.claude/channels/whatsapp/auth/`.
+
+### 3. Start the daemon
+
+Two options.
+
+**Option A — launchd (recommended for 24/7):**
+
+```bash
+# Copy the template and edit absolute paths inside
+cp code.claude.whatsapp-daemon.plist ~/Library/LaunchAgents/
+# Edit ~/Library/LaunchAgents/code.claude.whatsapp-daemon.plist
+#   - ProgramArguments[1] → absolute path to wa-daemon.cjs
+#   - WorkingDirectory → this repo's absolute path
+#   - WHATSAPP_STATE_DIR + log paths → absolute path to ~/.claude/channels/whatsapp
+launchctl load ~/Library/LaunchAgents/code.claude.whatsapp-daemon.plist
+```
+
+**Option B — foreground for testing:**
+
+```bash
+WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp npm run daemon
+```
+
+Daemon logs land at `~/.claude/channels/whatsapp/daemon.log`. The session client will also auto-spawn the daemon (detached) if it finds `/tmp/claude-wa.sock` missing — set `WA_AUTO_SPAWN=0` to disable.
+
+### 4. Configure `.mcp.json` in each project
+
+Already handled if you install this as a Claude Code plugin. For a manual config:
 
 ```json
 {
   "mcpServers": {
     "whatsapp": {
       "command": "node",
-      "args": ["/path/to/claude-code-whatsapp/server.cjs"],
-      "env": {
-        "WHATSAPP_STATE_DIR": "~/.claude/channels/whatsapp"
-      }
+      "args": ["/absolute/path/to/claude-whatsapp-mcp/session-client.cjs"]
     }
   }
 }
 ```
 
-### 3. Pair with WhatsApp
+### 5. Claim a session
 
-```bash
-mkdir -p ~/.claude/channels/whatsapp/auth
-WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp node pair.cjs
+In any Claude Code terminal where you want untagged phone replies to land:
+
+```
+/connect-wa
 ```
 
-The script shows both a **QR code** and a **pairing code**. On your phone:
-- **QR:** WhatsApp > Linked Devices > Link a Device — scan the QR
-- **Code:** WhatsApp > Linked Devices > Link a Device > Link with phone number — enter the code
+You can also just use `#<basename>` from the phone to address a session that isn't active, or quote-reply one of its outbound messages.
 
-Wait for "✅ WhatsApp connected!" before closing.
+## Skills
 
-### 4. Start Claude Code
+Three user-invocable slash commands are installed to `~/.claude/skills/`:
 
-```bash
-WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp \
-  claude --dangerously-load-development-channels "server:whatsapp"
-```
+| Command            | Purpose                                                                 |
+|--------------------|-------------------------------------------------------------------------|
+| `/connect-wa`      | Claim this terminal as the active WhatsApp listener                     |
+| `/disconnect-wa`   | Release the active-session claim; another registered session takes over |
+| `/wa-status`       | List every registered session and whether WhatsApp is connected         |
 
-On the first run, select "I am using this for local development" when prompted.
+## MCP tools
 
-### 5. Access control (optional)
+| Tool                       | Description                                                       |
+|----------------------------|-------------------------------------------------------------------|
+| `reply`                    | Send text + file attachments (auto-prefixed with `[tag]`)         |
+| `react`                    | Emoji reaction on a message                                       |
+| `download_attachment`      | Download media to `~/.claude/channels/whatsapp/inbox/`            |
+| `fetch_messages`           | Recent messages for a chat (daemon cache)                         |
+| `claim_active_session`     | Make this session the active untagged-reply target                |
+| `release_active_session`   | Release the active claim                                          |
+| `list_sessions`            | Every registered session + which one is active                    |
 
-Create `~/.claude/channels/whatsapp/access.json`:
+## Access control
+
+`~/.claude/channels/whatsapp/access.json`:
 
 ```json
 {
   "allowFrom": ["5511999999999"],
   "allowGroups": false,
   "allowedGroups": [],
-  "requireAllowFromInGroups": false
+  "requireAllowFromInGroups": false,
+  "confirmToken": null
 }
 ```
 
-- `allowFrom: []` (empty) = accept messages from anyone
-- `allowFrom: ["5511999999999"]` = only from this number
-- `allowGroups: true` + `allowedGroups: ["xxx@g.us"]` = specific groups
+- `allowFrom: []` — accept from anyone (don't do this in production)
+- `allowFrom: ["<E.164 number>"]` — only from your own number
+- `confirmToken: "some-secret"` — optional. If set, inbound messages that start with the token get `meta.origin_confirmed="true"`; others get `"false"`. Claude sees this and treats destructive operations (Write/Edit/Bash) as pending approval unless confirmed. You still get a permission request on the phone for those — the token is an *addition*, not a replacement.
 
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `reply` | Send text + file attachments (images, audio, video, documents) |
-| `react` | Add an emoji reaction to a message |
-| `download_attachment` | Download media from a received message |
-| `fetch_messages` | List recent messages from session cache |
-
-## Permission Relay
-
-When Claude Code needs permission to run a tool, it can send the request to your WhatsApp:
+Permission requests from Claude arrive on WhatsApp as:
 
 ```
-🔐 Permission request [tbxkq]
+🔐 [polybillionaire] Permission request [tbxkq]
 
 Bash: rm -rf /tmp/foo
 
 Reply "yes tbxkq" or "no tbxkq"
 ```
 
-Reply from your phone and Claude Code will proceed (or stop). The plugin reacts with ✅ or ❌ to confirm.
+Reply from phone; Claude proceeds or stops. The plugin reacts ✅/❌ to confirm receipt.
 
-Requires Claude Code v2.1.81+ and the `claude/channel/permission` capability (enabled by default in v0.0.3).
+## Security
 
-## Stability Design
+This plugin lets anyone on your WhatsApp allowlist send prompts to Claude Code sessions with access to your codebase. Attack surface in the multi-session setup:
 
-This plugin was rewritten based on analysis of [OpenClaw's WhatsApp extension](https://github.com/openclaw/openclaw/tree/main/extensions/whatsapp), which runs 24/7 without issues. Key patterns:
+1. **Use `allowFrom`.** Empty = open relay. Don't.
+2. **Secondary number recommended.** Use a Google Voice / second SIM for the bot account. Running on your primary number increases ban risk with any unofficial WhatsApp client.
+3. **Destructive tools need confirmation.** Configure Claude Code's `allowedTools` to exclude `Write`, `Edit`, `Bash(destructive)` by default — those trigger permission relay to the phone. Set `confirmToken` for an extra password-gate hint.
+4. **Origin tagging.** Every WhatsApp-sourced channel message has `meta.origin="whatsapp"` so Claude can distinguish it from terminal input.
+5. **Kill switch.** `touch ~/.claude/channels/whatsapp/PANIC` — daemon polls this file every 5s and shuts down when it appears.
+6. **Socket perms.** `/tmp/claude-wa.sock` is mode `0700`; state dir is `0700`.
 
-| Pattern | Description |
-|---------|-------------|
-| 515 = reconnect | WhatsApp sends 515 regularly. It's a normal restart request, not an error |
-| Never process.exit | Only stop on 440 (conflict) or 401 (logout). Everything else reconnects |
-| New socket each time | Never reuse a dead socket — create fresh on every reconnect |
-| Backoff with jitter | Prevents thundering herd. Reset after 60s of healthy connection |
-| Watchdog timer | 30min without inbound messages = force reconnect (detects zombie connections) |
-| Creds backup | Auto-backup before each save. Auto-restore if JSON is corrupted |
-| Listener cleanup | Remove all event listeners before creating new socket (prevents leaks) |
+## Connection stability
+
+Preserved from upstream (OpenClaw-derived patterns, lived for 24/7 operation):
+
+| Pattern                    | Behavior                                                            |
+|----------------------------|---------------------------------------------------------------------|
+| 515 is normal              | WhatsApp restart request → reconnect in 2s                          |
+| Never `process.exit`       | Only 440 (conflict) or 401 (logout) halt permanently                |
+| Exponential backoff        | factor 1.8, jitter ±25%, max 30s, reset after 60s of healthy uptime |
+| Watchdog                   | no inbound for 30 min → force reconnect                             |
+| Creds backup               | auto-backup before each save, auto-restore if corrupt               |
+| Singleton lock             | PID file prevents double-daemon                                     |
+| Crypto-error recovery      | Baileys `bad mac` / auth errors → reconnect, not crash              |
 
 ## Troubleshooting
 
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| "WhatsApp not connected" | Auth expired or not paired | Run `pair.cjs` and scan QR |
-| Error 515 | Normal — WhatsApp requested restart | v0.0.3 handles automatically. If old version: update |
-| Error 440 | Two devices competing | Unlink in phone settings, re-pair |
-| Error 401 | Logged out | Session invalidated, re-pair |
-| Rate limit on pairing | Too many rapid attempts | Wait 1-2 hours, try ONCE |
-| Messages stop without error | Zombie connection | Watchdog (v0.0.3) detects in 30min. Or restart manually |
-| creds.json corrupted | Crash during save | v0.0.3 restores from backup automatically |
+| Issue                                          | Fix                                                                   |
+|------------------------------------------------|-----------------------------------------------------------------------|
+| `daemon request timeout`                       | Daemon not running. `npm run daemon` or `launchctl start …`           |
+| `WhatsApp not connected`                       | Pair again: `npm run pair`                                            |
+| Inbound reacts ❓                              | No route matched. Use `#<tag>`, `!all`, quote-reply, or `/connect-wa` |
+| 440 in daemon.log                              | A 5th device replaced the daemon. Unlink something, re-pair           |
+| Messages stop silently                         | Watchdog catches in 30 min, or `launchctl stop && start`              |
+| Two daemons running                            | PID lock should prevent; if not, `launchctl unload` then re-load      |
 
-## Changelog
+## Limitations
 
-### v0.0.3 (2026-03-24)
-- **Breaking:** Rewrote connection lifecycle based on OpenClaw patterns
-- 515 treated as normal reconnect (was fatal `process.exit`)
-- Never `process.exit` in reconnect loop (only 440/401 stop)
-- Exponential backoff with jitter + reset after healthy period (60s)
-- Watchdog detects stale connections (30min timeout)
-- Credential backup/restore before each save
-- `getMessage` handler for E2EE retry (required in Baileys v7)
-- Crypto error handler (reconnect instead of crash)
-- Permission relay capability (`claude/channel/permission`)
-- `process.setMaxListeners(50)` to avoid warnings
-- Full listener cleanup before reconnecting
+- WhatsApp has no search API. `fetch_messages` only returns what the daemon has seen since startup.
+- `CLAUDE_SESSION_ID` env var isn't guaranteed to reach the MCP subprocess — session client falls back to a generated UUID when it's missing (tag-based routing still works).
+- Baileys is an unofficial client. Use on a secondary WhatsApp account, not your primary line.
 
-### v0.0.2 (2026-03-23)
-- `browser` fixed to `["Mac OS", "Safari", "1.0.0"]` (valid for Baileys v7)
-- Basic exponential backoff + max retries
-- Creds save with retry
-- Permission relay (outbound + inbound)
+## Credits
 
-### v0.0.1 (2026-03-21)
-- Initial implementation based on OpenClaw's architecture
-- Baileys v7.0.0-rc.9
-- MCP server with channel capability
-- 4 tools: reply, react, download_attachment, fetch_messages
-- Access control via allowlist
-- Deduplication cache (20min TTL)
+- [`diogo85/claude-code-whatsapp`](https://github.com/diogo85/claude-code-whatsapp) — upstream plugin, production-tuned single-session
+- [WhiskeySockets/Baileys](https://github.com/WhiskeySockets/Baileys) — WhatsApp Web Multi-Device library
+- [OpenClaw](https://github.com/openclaw/openclaw) — connection stability reference
 
 ## License
 

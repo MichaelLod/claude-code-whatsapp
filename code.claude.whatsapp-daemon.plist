@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Launchd plist for wa-daemon.cjs.
+
+  Install:
+    1. Copy to ~/Library/LaunchAgents/code.claude.whatsapp-daemon.plist
+    2. Edit the two <string> paths below to match your setup:
+       - WorkingDirectory → absolute path to this repo
+       - ProgramArguments[1] → absolute path to wa-daemon.cjs
+       - WHATSAPP_STATE_DIR → absolute path to ~/.claude/channels/whatsapp
+    3. launchctl load ~/Library/LaunchAgents/code.claude.whatsapp-daemon.plist
+    4. launchctl start code.claude.whatsapp-daemon
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/code.claude.whatsapp-daemon.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>code.claude.whatsapp-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/ABSOLUTE/PATH/TO/claude-whatsapp-mcp/wa-daemon.cjs</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/claude-whatsapp-mcp</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WHATSAPP_STATE_DIR</key>
+        <string>/ABSOLUTE/PATH/TO/HOME/.claude/channels/whatsapp</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/HOME/.claude/channels/whatsapp/daemon.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/HOME/.claude/channels/whatsapp/daemon.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

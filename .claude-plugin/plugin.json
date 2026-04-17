@@ -1,11 +1,12 @@
 {
   "name": "whatsapp",
-  "description": "WhatsApp channel for Claude Code — messaging bridge via Baileys (WhatsApp Web Multi-Device) with built-in access control.",
-  "version": "0.0.1",
+  "description": "Multi-session WhatsApp channel for Claude Code. One Baileys connection shared by N Claude Code terminals via a local daemon; inbound messages route by [tag] prefix or quote-reply. Fork of diogo85/claude-code-whatsapp.",
+  "version": "0.1.0",
   "keywords": [
     "whatsapp",
     "messaging",
     "channel",
-    "mcp"
+    "mcp",
+    "multi-session"
   ]
 }
