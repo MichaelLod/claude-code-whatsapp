@@ -112,6 +112,27 @@ function toJid(phone) {
   return `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
 }
 
+// Baileys 7 routes 1:1 chats via @lid (privacy) rather than the phone-number
+// JID. Baileys persists the mapping as lid-mapping-<lid>_reverse.json → "<phone>".
+// Given a JID, return the set of equivalent JIDs we should match against the
+// allowlist (phone-number form + LID form).
+function resolveJidAliases(jid) {
+  const out = new Set([jid]);
+  const bare = jid.split("@")[0].split(":")[0];
+  if (jid.endsWith("@lid")) {
+    try {
+      const phone = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, `lid-mapping-${bare}_reverse.json`), "utf8"));
+      if (phone) out.add(`${phone}@s.whatsapp.net`);
+    } catch {}
+  } else if (jid.endsWith("@s.whatsapp.net")) {
+    try {
+      const lid = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, `lid-mapping-${bare}.json`), "utf8"));
+      if (lid) out.add(`${lid}@lid`);
+    } catch {}
+  }
+  return out;
+}
+
 function isAllowed(jid, participant) {
   const access = loadAccess();
   const isGroup = jid.endsWith("@g.us");
@@ -119,12 +140,14 @@ function isAllowed(jid, participant) {
     if (!access.allowGroups) return false;
     if (access.allowedGroups.length > 0 && !access.allowedGroups.includes(jid)) return false;
     if (access.requireAllowFromInGroups && participant) {
-      return access.allowFrom.some((a) => toJid(a) === participant || a === participant);
+      const aliases = resolveJidAliases(participant);
+      return access.allowFrom.some((a) => aliases.has(toJid(a)) || aliases.has(a));
     }
     return true;
   }
   if (access.allowFrom.length === 0) return true;
-  return access.allowFrom.some((a) => toJid(a) === jid || a === jid);
+  const aliases = resolveJidAliases(jid);
+  return access.allowFrom.some((a) => aliases.has(toJid(a)) || aliases.has(a));
 }
 
 // ── Path safety for outbound files ──────────────────────────────────
@@ -417,24 +440,37 @@ function getQuotedStanzaId(msg) {
 
 // ── Session registry ────────────────────────────────────────────────
 
-const sessions = new Map(); // sessionId → { socket, pid, cwd, tag, lastSeen }
+const sessions = new Map(); // sessionId → { socket, pid, cwd, tag, number, lastSeen }
 const socketToSession = new WeakMap(); // socket → sessionId
+const numberToSessionId = new Map(); // 1..99 → sessionId
 let activeSessionId = null;
+
+function allocSessionNumber() {
+  for (let n = 1; n <= 99; n++) {
+    if (!numberToSessionId.has(n)) return n;
+  }
+  return null;
+}
 
 function registerSession(sock, { sessionId, pid, cwd, tag }) {
   const prev = sessions.get(sessionId);
   if (prev && prev.socket && prev.socket !== sock) {
     try { prev.socket.end(); } catch {}
   }
-  sessions.set(sessionId, { socket: sock, pid, cwd, tag, lastSeen: Date.now() });
+  // Reuse prior number on reconnect; otherwise allocate fresh.
+  let number = prev?.number;
+  if (!number || numberToSessionId.get(number) !== sessionId) number = allocSessionNumber();
+  if (number) numberToSessionId.set(number, sessionId);
+  sessions.set(sessionId, { socket: sock, pid, cwd, tag, number, lastSeen: Date.now() });
   socketToSession.set(sock, sessionId);
   if (!activeSessionId) activeSessionId = sessionId; // first session = default active
-  log(`session registered: ${sessionId.slice(0, 8)} pid=${pid} tag=${tag} cwd=${cwd}`);
+  log(`session registered: ${sessionId.slice(0, 8)} number=${number} pid=${pid} tag=${tag} cwd=${cwd}`);
 }
 
 function unregisterSession(sessionId) {
   const s = sessions.get(sessionId);
   if (!s) return;
+  if (s.number && numberToSessionId.get(s.number) === sessionId) numberToSessionId.delete(s.number);
   sessions.delete(sessionId);
   if (activeSessionId === sessionId) {
     const next = sessions.keys().next().value;
@@ -533,11 +569,25 @@ async function handleInbound(msg, jid, participant) {
   let targets = []; // list of session IDs
   let routedBy = null;
 
+  const numMatch = /^(\d{1,2})\s+([\s\S]*)$/.exec(text);
   const hashMatch = /^#([a-zA-Z0-9_-]+)\s+([\s\S]*)$/.exec(text);
-  const allMatch = /^!all\s+([\s\S]*)$/i.exec(text);
+  const allMatch = /^!all(?:\s+([\s\S]*))?$/i.exec(text);
   const quotedId = getQuotedStanzaId(message);
 
-  if (hashMatch) {
+  if (numMatch) {
+    const n = parseInt(numMatch[1], 10);
+    if (n >= 1 && n <= 99) {
+      const sid = numberToSessionId.get(n);
+      if (sid && sessions.has(sid)) {
+        content = numMatch[2];
+        targets = [sid];
+        meta.route_number = String(n);
+        routedBy = "number";
+      }
+    }
+  }
+
+  if (!targets.length && hashMatch) {
     const tag = hashMatch[1];
     const stripped = hashMatch[2];
     targets = findSessionsByTag(tag);
@@ -545,7 +595,13 @@ async function handleInbound(msg, jid, participant) {
   }
 
   if (!targets.length && allMatch) {
-    content = allMatch[1];
+    const body = (allMatch[1] || "").trim();
+    if (!body) {
+      content = "Status check: reply with ONE short line describing what you are working on right now. Nothing else.";
+      meta.status_request = "true";
+    } else {
+      content = body;
+    }
     targets = [...sessions.keys()];
     meta.route_broadcast = "true";
     routedBy = "broadcast";
@@ -748,7 +804,12 @@ async function handleFrame(clientSock, line) {
         cwd: frame.cwd,
         tag: frame.tag,
       });
-      sendFrame(clientSock, { op: "registered", session_id: frame.session_id, connected: connectionReady });
+      sendFrame(clientSock, {
+        op: "registered",
+        session_id: frame.session_id,
+        number: sessions.get(frame.session_id)?.number || null,
+        connected: connectionReady,
+      });
       return;
     }
     case "unregister": {

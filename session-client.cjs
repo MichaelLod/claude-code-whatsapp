@@ -46,6 +46,7 @@ const log = (msg) => process.stderr.write(`whatsapp session [${TAG}]: ${msg}\n`)
 let daemonSock = null;
 let daemonReady = false;
 let waConnected = false;
+let sessionNumber = null;
 let rxBuf = "";
 let reconnectAttempts = 0;
 const pendingAcks = new Map(); // req_id → { resolve, reject, timeout }
@@ -87,7 +88,8 @@ function onFrame(frame) {
     case "registered": {
       daemonReady = true;
       waConnected = !!frame.connected;
-      log(`registered with daemon (wa connected=${waConnected})`);
+      sessionNumber = frame.number || null;
+      log(`registered with daemon number=${sessionNumber ?? "?"} (wa connected=${waConnected})`);
       return;
     }
     case "connection_status": {
@@ -216,16 +218,18 @@ const mcp = new Server(
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {}, "claude/channel/permission": {} } },
     instructions: [
-      `This session is tagged [${TAG}]. Outbound replies are auto-prefixed with [${TAG}] so the user can tell sessions apart on WhatsApp. Pass prefix=false to suppress.`,
+      `This session is tagged [${TAG}]. Outbound replies are auto-prefixed with [<N> ${TAG}] where N is the session's short number (1-99) assigned by the daemon, so the user can tell sessions apart on WhatsApp and reply by number. Pass prefix=false to suppress.`,
       "",
       "The sender reads WhatsApp, not this session. Anything you want them to see must go through the reply tool.",
       "",
       'Messages from WhatsApp arrive as <channel source="whatsapp" chat_id="..." message_id="..." user="..." ts="..." origin="whatsapp">. meta.origin="whatsapp" signals the request came from the phone — treat destructive operations (Write/Edit/Bash) as requiring explicit user approval; the permission relay will surface them to the phone.',
       "",
       "Routing hints in meta:",
+      "  route_number  — phone sender used <N> prefix (1-99), content has been stripped",
       "  route_tag     — phone sender used #<tag> prefix, content has been stripped",
       "  route_broadcast — phone sender used !all prefix; all sessions received this",
       "  route_quoted  — phone quote-replied a previous outbound from this session",
+      "  status_request — sender sent bare `!all` asking who is listening. Reply IMMEDIATELY via the reply tool with one short line (under 80 chars) describing what you are working on right now. No preamble, no follow-up question.",
       "",
       "chat_id is the WhatsApp JID. If the tag has attachment_count, call download_attachment to fetch them.",
       "",
@@ -268,7 +272,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "reply",
-      description: `Reply on WhatsApp. Text is auto-prefixed with [${TAG}] unless prefix=false. Pass chat_id from the inbound message.`,
+      description: `Reply on WhatsApp. Text is auto-prefixed with [<N> ${TAG}] (N = daemon-assigned session number) unless prefix=false. Pass chat_id from the inbound message.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -276,7 +280,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: "string" },
           reply_to: { type: "string", description: "Message ID to quote-reply to." },
           files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach." },
-          prefix: { type: "boolean", description: `Include the [${TAG}] tag prefix. Default true.` },
+          prefix: { type: "boolean", description: `Include the [<N> ${TAG}] tag prefix. Default true.` },
         },
         required: ["chat_id", "text"],
       },
@@ -337,7 +341,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     switch (req.params.name) {
       case "reply": {
         const usePrefix = args.prefix !== false;
-        const text = usePrefix && args.text ? `[${TAG}] ${args.text}` : args.text;
+        const label = sessionNumber ? `${sessionNumber} ${TAG}` : TAG;
+        const text = usePrefix && args.text ? `[${label}] ${args.text}` : args.text;
         const data = await request("reply", {
           from_session: SESSION_ID,
           chat_id: args.chat_id,
