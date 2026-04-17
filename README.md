@@ -122,16 +122,16 @@ The session client auto-spawns the daemon (detached) if it finds `/tmp/claude-wa
 
 ### 5. Start Claude Code with the channel enabled
 
-`server:` channels are experimental and require two flags. Put this in `~/.zshrc`:
+`server:` channels are experimental. They're loaded via `--dangerously-load-development-channels` (which takes the tagged entry directly — there's no separate `--channels` flag in this form). Put this in `~/.zshrc`:
 
 ```bash
-alias cc='command claude --dangerously-skip-permissions --dangerously-load-development-channels --channels server:whatsapp'
-alias claude='command claude --dangerously-load-development-channels --channels server:whatsapp'
+alias cc='command claude --dangerously-skip-permissions --dangerously-load-development-channels server:whatsapp'
+alias claude='command claude --dangerously-load-development-channels server:whatsapp'
 ```
 
 Notes:
-- `command claude` prevents zsh from recursively expanding the `claude` alias, which would otherwise duplicate `--channels server:whatsapp`.
-- `--channels whatsapp` (bare) is rejected — must be `server:whatsapp` (or `plugin:<name>@<marketplace>` if installed as a plugin).
+- `command claude` prevents zsh from recursively expanding the `claude` alias, which would otherwise duplicate the entry.
+- Entries must be tagged: `server:whatsapp` (manual `.mcp.json` config) or `plugin:<name>@<marketplace>` (installed as a plugin). Bare `whatsapp` is rejected.
 
 ### 6. Claim a session
 
@@ -225,8 +225,8 @@ Preserved from upstream (OpenClaw-derived patterns, tuned for 24/7 operation):
 
 | Issue                                           | Fix                                                                        |
 |-------------------------------------------------|----------------------------------------------------------------------------|
-| `--channels entries must be tagged`             | Use `--channels server:whatsapp` (not bare `whatsapp`). See setup step 5.  |
-| `server: entries need --dangerously-load-development-channels` | Add that flag alongside `--channels`. See setup step 5.     |
+| `--channels entries must be tagged` / `--dangerously-load-development-channels entries must be tagged` | Entry must be `server:whatsapp` or `plugin:<name>@<marketplace>`. See setup step 5. |
+| `server: entries need --dangerously-load-development-channels` | Use `--dangerously-load-development-channels server:whatsapp` (the flag takes the entry directly — no separate `--channels`). |
 | `server:whatsapp` listed twice on startup       | zsh recursively expanded an alias — add `command` prefix in the alias.     |
 | Session doesn't wake on `!all`                  | `/connect-wa` wasn't run in that session, so no Monitor is attached.       |
 | `daemon request timeout`                        | Daemon not running. `npm run daemon` or `launchctl start …`.               |
