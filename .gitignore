@@ -5,3 +5,8 @@ auth/
 .DS_Store
 bun.lock
 package-lock.json
+
+# Per-host MCP server path — each user writes their own
+.mcp.json
+# Session handover notes — not meant to ship
+HANDOVER.md

@@ -41,6 +41,34 @@ const TAG = process.env.WA_SESSION_TAG || path.basename(CWD) || "session";
 
 const log = (msg) => process.stderr.write(`whatsapp session [${TAG}]: ${msg}\n`);
 
+// Event log for the Monitor-based delivery workaround. One line per inbound,
+// meta only — no message content. Claude's Monitor tool tails this file and
+// surfaces each event as a notification, waking the session to reply.
+const INBOX_LOG = path.join(STATE_DIR, `inbox-${TAG}.log`);
+const INBOX_LOG_MAX_BYTES = 256 * 1024;
+
+function recordInbound(meta) {
+  try {
+    const st = fs.statSync(INBOX_LOG);
+    if (st.size > INBOX_LOG_MAX_BYTES) fs.truncateSync(INBOX_LOG, 0);
+  } catch {}
+  const route = meta.route_number ? `number:${meta.route_number}`
+    : meta.route_tag ? `tag:${meta.route_tag}`
+    : meta.route_broadcast ? "broadcast"
+    : meta.route_quoted ? "quoted"
+    : "active";
+  const parts = [
+    new Date().toISOString(),
+    "inbound",
+    `chat=${meta.chat_id}`,
+    `msg=${meta.message_id}`,
+    `route=${route}`,
+  ];
+  if (meta.status_request === "true") parts.push("status_request");
+  if (meta.attachment_count) parts.push(`attach=${meta.attachment_count}`);
+  try { fs.appendFileSync(INBOX_LOG, parts.join(" ") + "\n"); } catch {}
+}
+
 // ── Daemon connection with reconnect ────────────────────────────────
 
 let daemonSock = null;
@@ -115,6 +143,7 @@ function onFrame(frame) {
 
 function emitChannelInbound(frame) {
   const { content, meta } = frame;
+  recordInbound(meta);
   mcp.notification({
     method: "notifications/claude/channel",
     params: { content, meta },
