@@ -58,6 +58,8 @@ Commands handled by the daemon directly (no Claude turn required):
 | `!spawn <path>`      | Absolute or `~`-prefixed path also accepted                                   |
 | `!spawn ... <msg>`   | Trailing text is typed into the new terminal as the first prompt (4s delay)   |
 | `!new <name>`        | `mkdir $WA_WORK_ROOT/<name>` and spawn `claude` in it                         |
+| `!kill <N>`          | SIGTERM session #N — its Claude Code process and the session-client          |
+| `!kill <tag>`        | Same, matching sessions by tag (prefix match)                                 |
 
 Override the project root with `WA_WORK_ROOT=/some/path` in the daemon's env (the launchd plist is a good place).
 

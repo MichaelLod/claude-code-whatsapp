@@ -616,6 +616,10 @@ async function handleInbound(msg, jid, participant) {
       "  !spawn ... <msg>  trailing text becomes the first prompt",
       "  !new <name>       mkdir " + WORK_ROOT + "/<name> and spawn",
       "",
+      "Killing sessions:",
+      "  !kill <N>         SIGTERM session #N (its Claude Code + client)",
+      "  !kill <tag>       kill sessions matching tag (prefix match)",
+      "",
       "Other:",
       "  !help             this message",
     ].join("\n");
@@ -685,6 +689,47 @@ async function handleInbound(msg, jid, participant) {
       log(`spawn failed: ${e.message}`);
       await sock.sendMessage(jid, { text: `❌ spawn failed: ${e.message}` });
     }
+    return;
+  }
+
+  // !kill <N|#tag|tag>       → SIGTERM the session's Claude Code process (its parent)
+  //                            plus the session-client itself, so the Terminal
+  //                            window drops back to the shell prompt.
+  const killMatch = /^!kill\s+(\S+)\s*$/i.exec(text);
+  if (killMatch) {
+    const target = killMatch[1];
+    let victimIds = [];
+    if (/^\d+$/.test(target)) {
+      const sid = numberToSessionId.get(parseInt(target, 10));
+      if (sid && sessions.has(sid)) victimIds.push(sid);
+    } else {
+      const tag = target.startsWith("#") ? target.slice(1) : target;
+      victimIds = findSessionsByTag(tag);
+    }
+    if (!victimIds.length) {
+      await sock.sendMessage(jid, { text: `❌ no session matching ${target}` });
+      return;
+    }
+    const getPPID = (pid) => new Promise((resolve) => {
+      const child = spawnProcess("ps", ["-o", "ppid=", "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] });
+      let out = "";
+      child.stdout.on("data", (d) => out += d);
+      child.on("exit", () => resolve(parseInt(out.trim(), 10) || null));
+      child.on("error", () => resolve(null));
+    });
+    const lines = [];
+    for (const sid of victimIds) {
+      const s = sessions.get(sid);
+      if (!s) continue;
+      const ppid = await getPPID(s.pid);
+      let killed = false;
+      if (ppid && ppid !== 1) {
+        try { process.kill(ppid, "SIGTERM"); killed = true; } catch {}
+      }
+      try { process.kill(s.pid, "SIGTERM"); } catch {}
+      lines.push(`${killed ? "🔪" : "⚠️"} ${s.number ? `${s.number} ` : ""}[${s.tag}] pid=${s.pid}${ppid ? ` ppid=${ppid}` : ""}`);
+    }
+    await sock.sendMessage(jid, { text: lines.join("\n") });
     return;
   }
 
