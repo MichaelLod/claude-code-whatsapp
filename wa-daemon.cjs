@@ -558,17 +558,25 @@ async function handleInbound(msg, jid, participant) {
   //                                    (bare name is resolved against WORK_ROOT)
   //   !new <name> [prompt]           → mkdir WORK_ROOT/<name> and spawn
   const aplEsc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const sendKeystroke = (script) =>
+    spawnProcess("osascript", ["-e", `tell application "System Events" to tell process "Terminal" to ${script}`], { stdio: "ignore" });
   const openClaudeInFolder = (folder, initialPrompt) => {
     const shellCmd = `cd "${aplEsc(folder)}" && claude --dangerously-skip-permissions`;
     const osa = `tell application "Terminal" to do script "${aplEsc(shellCmd)}"`;
     spawnProcess("osascript", ["-e", osa, "-e", 'tell application "Terminal" to activate'], {
       stdio: "ignore", detached: true,
     }).unref();
+    // --dangerously-load-development-channels (applied by the user's ~/.zshrc
+    // alias) shows a one-time confirmation dialog on each launch with
+    // "I am using this for local development" already highlighted. Press
+    // Enter to accept so the launch is hands-free. If the dialog isn't
+    // showing (e.g. channels not aliased in), the Enter is a no-op at an
+    // empty prompt.
+    setTimeout(() => sendKeystroke("keystroke return"), 2500);
     if (initialPrompt) {
       setTimeout(() => {
-        const typeOsa = `tell application "System Events" to tell process "Terminal" to keystroke "${aplEsc(initialPrompt)}" & return`;
-        spawnProcess("osascript", ["-e", typeOsa], { stdio: "ignore" });
-      }, 4000);
+        sendKeystroke(`keystroke "${aplEsc(initialPrompt)}" & return`);
+      }, 5500);
     }
     log(`spawned Terminal.app window running claude in ${folder}`);
   };
