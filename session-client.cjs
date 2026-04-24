@@ -324,6 +324,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "progress",
+      description: "Post a live status update to WhatsApp so the sender can watch your work happen. Successive calls in the same chat APPEND to one rolling message (edited in place), so use this between long-running tool calls — e.g. before/after a Bash, Edit, WebFetch, or while reasoning through something tricky. Lead each call with an emoji (🛠️ Edit, 🌐 fetch, 🔍 search, 🧠 thinking, ⏳ waiting, ✅ step done). Pass reset=true at the start of a brand-new task to begin a fresh message. Cheap to call — prefer over staying silent for >5s.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "WhatsApp JID — pass the inbound chat_id." },
+          text: { type: "string", description: "One short line, emoji-led. e.g. '🛠️ editing wa-daemon.cjs'." },
+          reset: { type: "boolean", description: "Start a fresh rolling message. Default false." },
+        },
+        required: ["chat_id", "text"],
+      },
+    },
+    {
       name: "download_attachment",
       description: "Download media from a WhatsApp message. Returns file path ready to Read.",
       inputSchema: {
@@ -389,6 +402,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           emoji: args.emoji,
         });
         return { content: [{ type: "text", text: "reacted" }] };
+      }
+      case "progress": {
+        await request("progress", {
+          from_session: SESSION_ID,
+          chat_id: args.chat_id,
+          text: args.text,
+          reset: !!args.reset,
+        });
+        return { content: [{ type: "text", text: "posted" }] };
       }
       case "download_attachment": {
         const data = await request("download_attachment", {

@@ -22,6 +22,24 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn: spawnProcess } = require("child_process");
+
+// Load .env.local from this repo (working directory). Tiny parser — no
+// dotenv dep. Existing process.env wins (so launchd/shell can override).
+function loadDotEnv(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); } catch { return; }
+  for (const line of raw.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    if (process.env[m[1]] !== undefined) continue;
+    let val = m[2];
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    process.env[m[1]] = val;
+  }
+}
+loadDotEnv(path.join(__dirname, ".env.local"));
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -419,6 +437,28 @@ function extractMediaInfo(msg) {
   return null;
 }
 
+// ── Voice transcription (OpenAI Whisper) ───────────────────────────
+
+async function transcribeAudio(buf, mimetype) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY not set in env / .env.local");
+  const ext = mimeToExt(mimetype) || "ogg";
+  const form = new FormData();
+  form.append("file", new Blob([buf], { type: mimetype || "audio/ogg" }), `voice.${ext}`);
+  form.append("model", "whisper-1");
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`whisper ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const json = await res.json();
+  return (json.text || "").trim();
+}
+
 function mimeToExt(mimetype) {
   const map = {
     "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
@@ -442,9 +482,10 @@ function getQuotedStanzaId(msg) {
 
 // ── Session registry ────────────────────────────────────────────────
 
-const sessions = new Map(); // sessionId → { socket, pid, cwd, tag, number, lastSeen }
+const sessions = new Map(); // sessionId → { socket, pid, cwd, tag, number, windowId, lastSeen }
 const socketToSession = new WeakMap(); // socket → sessionId
 const numberToSessionId = new Map(); // 1..99 → sessionId
+const pendingTerminalWindows = []; // [{ cwd, windowId, ts }] from !spawn / !new
 let activeSessionId = null;
 
 function allocSessionNumber() {
@@ -454,17 +495,63 @@ function allocSessionNumber() {
   return null;
 }
 
-function registerSession(sock, { sessionId, pid, cwd, tag }) {
+function registerSession(clientSock, { sessionId, pid, cwd, tag }) {
   const prev = sessions.get(sessionId);
-  if (prev && prev.socket && prev.socket !== sock) {
+  if (prev && prev.socket && prev.socket !== clientSock) {
     try { prev.socket.end(); } catch {}
   }
   // Reuse prior number on reconnect; otherwise allocate fresh.
   let number = prev?.number;
   if (!number || numberToSessionId.get(number) !== sessionId) number = allocSessionNumber();
   if (number) numberToSessionId.set(number, sessionId);
-  sessions.set(sessionId, { socket: sock, pid, cwd, tag, number, lastSeen: Date.now() });
-  socketToSession.set(sock, sessionId);
+  // Attach a Terminal windowId so !clear / !kill can target it. First
+  // try a pending !spawn entry matching this cwd. If none (manual
+  // `claude` launch outside !spawn), look up the windowId asynchronously
+  // by matching the process's controlling tty.
+  let windowId = prev?.windowId || null;
+  let pendingNotify = null;
+  if (!windowId) {
+    // macOS APFS is case-insensitive but case-preserving: a !spawn path
+    // typed as "Claude-WhatsApp-mcp" gets canonicalized by Node's
+    // process.cwd() to "claude-whatsapp-mcp", so compare case-insensitively
+    // after stripping trailing slashes.
+    const norm = (p) => p.replace(/\/+$/, "").toLowerCase();
+    const target = norm(cwd);
+    for (let i = pendingTerminalWindows.length - 1; i >= 0; i--) {
+      if (norm(pendingTerminalWindows[i].cwd) === target) {
+        windowId = pendingTerminalWindows[i].windowId;
+        pendingNotify = pendingTerminalWindows[i].notify || null;
+        pendingTerminalWindows.splice(i, 1);
+        break;
+      }
+    }
+  }
+  if (!windowId) lookupWindowIdByPid(pid).then((wid) => {
+    if (wid && sessions.get(sessionId) && !sessions.get(sessionId).windowId) {
+      sessions.get(sessionId).windowId = wid;
+      log(`session ${sessionId.slice(0, 8)}: attached windowId=${wid} via tty lookup`);
+    }
+  });
+  sessions.set(sessionId, { socket: clientSock, pid, cwd, tag, number, windowId, lastSeen: Date.now() });
+  if (pendingNotify && number) {
+    pendingNotify.registered = true;
+    if (pendingNotify.onStage) {
+      // If the new claude registered before the 7.5s dialog-dismissal
+      // timer fired, that stage was skipped. Emit it here first so the
+      // timeline stays in natural order: dismissed → ready.
+      if (!pendingNotify.dismissedShown) {
+        pendingNotify.onStage("🤝 dev-channels dialog dismissed");
+        pendingNotify.dismissedShown = true;
+      }
+      pendingNotify.onStage(`✅ session #${number} [${tag}] ready`);
+    } else if (pendingNotify.jid && sock) {
+      const quoted = pendingNotify.replyTo ? rawMessages.get(pendingNotify.replyTo) : undefined;
+      const text = `🆔 session #${number} assigned to [${tag}]\n${cwd}`;
+      sock.sendMessage(pendingNotify.jid, { text }, quoted ? { quoted } : undefined)
+        .catch((e) => log(`assigned-number notify failed: ${e.message || e}`));
+    }
+  }
+  socketToSession.set(clientSock, sessionId);
   if (!activeSessionId) activeSessionId = sessionId; // first session = default active
   log(`session registered: ${sessionId.slice(0, 8)} number=${number} pid=${pid} tag=${tag} cwd=${cwd}`);
 }
@@ -479,6 +566,85 @@ function unregisterSession(sessionId) {
     activeSessionId = next || null;
   }
   log(`session unregistered: ${sessionId.slice(0, 8)}`);
+}
+
+// Find the most recently modified transcript .jsonl for `cwd` and return
+// its last `usage` block (input / cache_creation / cache_read / output
+// tokens). Returns null if no transcript exists.
+function readLatestUsage(cwd) {
+  const projectsRoot = path.join(os.homedir(), ".claude", "projects");
+  const dir = path.join(projectsRoot, cwd.replace(/\//g, "-"));
+  let files;
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")); } catch { return null; }
+  if (!files.length) return null;
+  let newest = null, newestMtime = 0;
+  for (const f of files) {
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.mtimeMs > newestMtime) { newestMtime = st.mtimeMs; newest = f; }
+    } catch {}
+  }
+  if (!newest) return null;
+  let raw;
+  try { raw = fs.readFileSync(path.join(dir, newest), "utf8"); } catch { return null; }
+  // Walk backwards through lines for the latest line containing "usage".
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes('"usage"')) continue;
+    try {
+      const obj = JSON.parse(line);
+      const u = obj.message?.usage;
+      if (u) return u;
+    } catch {}
+  }
+  return null;
+}
+
+// Look up the Terminal windowId hosting the given process. Walks up the
+// parent chain (session-client → Claude Code → shell) until we find a
+// process whose controlling tty matches a Terminal tab. Returns null
+// for non-Terminal hosts (iTerm, ssh, etc.) or on any failure.
+function getProcInfo(pid) {
+  return new Promise((resolve) => {
+    const ps = spawnProcess("ps", ["-o", "ppid=,tty=", "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    ps.stdout.on("data", (d) => out += d);
+    ps.on("error", () => resolve(null));
+    ps.on("exit", () => {
+      const m = out.trim().match(/^(\d+)\s+(\S+)$/);
+      if (!m) return resolve(null);
+      resolve({ ppid: parseInt(m[1], 10), tty: m[2] });
+    });
+  });
+}
+
+async function lookupWindowIdByPid(pid) {
+  let cur = pid;
+  let tty = null;
+  for (let i = 0; i < 6 && cur && cur !== 1; i++) {
+    const info = await getProcInfo(cur);
+    if (!info) return null;
+    if (info.tty && info.tty !== "?" && info.tty !== "??") { tty = info.tty; break; }
+    cur = info.ppid;
+  }
+  if (!tty) return null;
+  const ttyDev = tty.startsWith("/") ? tty : `/dev/${tty}`;
+  return new Promise((resolve) => {
+    const osa = `tell application "Terminal"
+  repeat with w in windows
+    repeat with tb in tabs of w
+      if (tty of tb) is "${ttyDev}" then return id of w
+    end repeat
+  end repeat
+  return ""
+end tell`;
+    const child = spawnProcess("osascript", ["-e", osa], { stdio: ["ignore", "pipe", "ignore"] });
+    let wOut = "";
+    child.stdout.on("data", (d) => wOut += d);
+    child.on("error", () => resolve(null));
+    child.on("exit", () => resolve(parseInt(wOut.trim(), 10) || null));
+  });
 }
 
 function findSessionsByTag(tag) {
@@ -518,12 +684,30 @@ function broadcastConnectionStatus(connected) {
 
 async function handleInbound(msg, jid, participant) {
   const message = msg.message;
-  const text = extractText(message);
+  let text = extractText(message);
   const media = extractMediaInfo(message);
   const msgId = msg.key.id || `${Date.now()}`;
   const isGroup = jid.endsWith("@g.us");
   const senderJid = participant || jid;
   const senderNumber = formatJid(senderJid);
+
+  // Voice message → transcribe via OpenAI Whisper, then treat the
+  // transcript as if the user had typed it. Routing prefixes spoken at
+  // the start (e.g. "five, ...") won't match — voice routes default to
+  // active session unless the user quote-replied a previous outbound.
+  let voiceTranscript = null;
+  let voiceError = null;
+  if (media?.type === "audio") {
+    try {
+      const buf = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+      voiceTranscript = await transcribeAudio(buf, media.mimetype);
+      text = voiceTranscript;
+      log(`transcribed voice (${buf.length}B): ${voiceTranscript.slice(0, 80)}`);
+    } catch (e) {
+      voiceError = String(e.message || e);
+      log(`voice transcription failed: ${voiceError}`);
+    }
+  }
 
   storeRecent(jid, {
     id: msgId, from: senderNumber,
@@ -558,26 +742,68 @@ async function handleInbound(msg, jid, participant) {
   //                                    (bare name is resolved against WORK_ROOT)
   //   !new <name> [prompt]           → mkdir WORK_ROOT/<name> and spawn
   const aplEsc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const sendKeystroke = (script) =>
-    spawnProcess("osascript", ["-e", `tell application "System Events" to tell process "Terminal" to ${script}`], { stdio: "ignore" });
-  const openClaudeInFolder = (folder, initialPrompt) => {
+  // Write `text` + newline directly into a Terminal tab's tty. Unlike
+  // `System Events ... keystroke`, this delivers input to the running
+  // program (e.g. Claude Code's TUI) reliably regardless of which window
+  // is frontmost or whether accessibility permissions are funky. Used to
+  // dismiss the dev-channels confirmation dialog and to send /clear.
+  const writeToTabTTY = (windowId, text) =>
+    spawnProcess("osascript", [
+      "-e", `tell application "Terminal" to do script "${aplEsc(text)}" in selected tab of window id ${windowId}`,
+    ], { stdio: "ignore" });
+  const openClaudeInFolder = (folder, initialPrompt, notify = null) => {
     const shellCmd = `cd "${aplEsc(folder)}" && claude --dangerously-skip-permissions`;
-    const osa = `tell application "Terminal" to do script "${aplEsc(shellCmd)}"`;
-    spawnProcess("osascript", ["-e", osa, "-e", 'tell application "Terminal" to activate'], {
-      stdio: "ignore", detached: true,
-    }).unref();
-    // --dangerously-load-development-channels (applied by the user's ~/.zshrc
-    // alias) shows a one-time confirmation dialog on each launch with
-    // "I am using this for local development" already highlighted. Press
-    // Enter to accept so the launch is hands-free. If the dialog isn't
-    // showing (e.g. channels not aliased in), the Enter is a no-op at an
-    // empty prompt.
-    setTimeout(() => sendKeystroke("keystroke return"), 2500);
-    if (initialPrompt) {
+    // Spawn the Terminal window AND capture its id. NOTE: `id of front
+    // window` does NOT return the new window — Terminal's z-order takes a
+    // beat to update. Instead, hold onto the tab reference returned by
+    // `do script` and find the window whose tab matches that tab's tty.
+    const osa = `tell application "Terminal"
+  set newTab to do script "${aplEsc(shellCmd)}"
+  activate
+  set newTty to tty of newTab
+  repeat with w in windows
+    repeat with tb in tabs of w
+      if (tty of tb) is newTty then return id of w
+    end repeat
+  end repeat
+end tell`;
+    const child = spawnProcess("osascript", ["-e", osa], {
+      stdio: ["ignore", "pipe", "ignore"], detached: true,
+    });
+    let out = "";
+    child.stdout.on("data", (d) => out += d);
+    child.on("exit", () => {
+      const windowId = parseInt(out.trim(), 10) || null;
+      if (!windowId) {
+        log(`spawn ${folder}: failed to capture window id (out=${JSON.stringify(out)})`);
+        notify?.onStage?.("⚠️ could not capture terminal window id");
+        return;
+      }
+      pendingTerminalWindows.push({ cwd: folder, windowId, ts: Date.now(), notify });
+      notify?.onStage?.(`🪟 terminal opened (window ${windowId})`);
+
+      // --dangerously-load-development-channels (applied by the user's
+      // ~/.zshrc alias) shows a confirmation dialog with "I am using this
+      // for local development" pre-highlighted. Send empty-line Returns
+      // via the tab's tty across the first several seconds — the exact
+      // appearance time varies with the Claude Code version. Extra
+      // Returns at Claude's empty prompt are no-ops.
+      [500, 1500, 2500, 3500, 5000, 7000].forEach((ms) =>
+        setTimeout(() => writeToTabTTY(windowId, ""), ms));
+      // After the last Enter has had a chance to land, mark the dialog
+      // dismissal stage — but only if registration hasn't already fired
+      // the "✅ ready" line, which happens when the new claude connects
+      // back faster than 7.5s and would make the ordering look wrong.
       setTimeout(() => {
-        sendKeystroke(`keystroke "${aplEsc(initialPrompt)}" & return`);
-      }, 5500);
-    }
+        if (!notify || notify.registered || notify.dismissedShown) return;
+        notify.onStage?.("🤝 dev-channels dialog dismissed, awaiting registration…");
+        notify.dismissedShown = true;
+      }, 7500);
+      if (initialPrompt) {
+        setTimeout(() => writeToTabTTY(windowId, initialPrompt), 9000);
+      }
+    });
+    child.unref();
     log(`spawned Terminal.app window running claude in ${folder}`);
   };
   const listProjects = () => fs.readdirSync(WORK_ROOT, { withFileTypes: true })
@@ -620,6 +846,13 @@ async function handleInbound(msg, jid, participant) {
       "  !kill <N>         SIGTERM session #N (its Claude Code + client)",
       "  !kill <tag>       kill sessions matching tag (prefix match)",
       "",
+      "Clearing context:",
+      "  !clear <N|tag>    send /clear to that session's terminal",
+      "",
+      "Inspecting:",
+      "  !ctx              context-window % for all sessions",
+      "  !ctx <N|tag>      …only the matching session(s)",
+      "",
       "Other:",
       "  !help             this message",
     ].join("\n");
@@ -656,8 +889,15 @@ async function handleInbound(msg, jid, participant) {
         return;
       }
       fs.mkdirSync(folder, { recursive: true });
-      openClaudeInFolder(folder, initialPrompt);
-      await sock.sendMessage(jid, { text: `✅ created ${folder} and spawned claude` });
+      const stages = [`🆕 created ${folder}`, `🚀 spawning claude…`];
+      const sent = await sock.sendMessage(jid, { text: stages.join("\n") });
+      const editKey = sent?.key;
+      const updateProgress = (line) => {
+        stages.push(line);
+        if (editKey) sock.sendMessage(jid, { text: stages.join("\n"), edit: editKey })
+          .catch((e) => log(`progress edit failed: ${e.message || e}`));
+      };
+      openClaudeInFolder(folder, initialPrompt, { jid, replyTo: msgId, onStage: updateProgress });
     } catch (e) {
       log(`new failed: ${e.message}`);
       await sock.sendMessage(jid, { text: `❌ new failed: ${e.message}` });
@@ -683,8 +923,15 @@ async function handleInbound(msg, jid, participant) {
       return;
     }
     try {
-      openClaudeInFolder(folder, initialPrompt);
-      await sock.sendMessage(jid, { text: `✅ spawned claude in ${folder}` });
+      const stages = [`🚀 spawning claude in ${folder}`];
+      const sent = await sock.sendMessage(jid, { text: stages.join("\n") });
+      const editKey = sent?.key;
+      const updateProgress = (line) => {
+        stages.push(line);
+        if (editKey) sock.sendMessage(jid, { text: stages.join("\n"), edit: editKey })
+          .catch((e) => log(`progress edit failed: ${e.message || e}`));
+      };
+      openClaudeInFolder(folder, initialPrompt, { jid, replyTo: msgId, onStage: updateProgress });
     } catch (e) {
       log(`spawn failed: ${e.message}`);
       await sock.sendMessage(jid, { text: `❌ spawn failed: ${e.message}` });
@@ -733,6 +980,81 @@ async function handleInbound(msg, jid, participant) {
     return;
   }
 
+  // !clear <N|#tag|tag>      → write "/clear" + newline directly to the
+  //                            session's Terminal tab, dropping Claude
+  //                            Code's current conversation context.
+  //                            Requires the session was spawned via
+  //                            !spawn / !new so we captured its window id.
+  const clearMatch = /^!clear\s+(\S+)\s*$/i.exec(text);
+  if (clearMatch) {
+    const target = clearMatch[1];
+    let victimIds = [];
+    if (/^\d+$/.test(target)) {
+      const sid = numberToSessionId.get(parseInt(target, 10));
+      if (sid && sessions.has(sid)) victimIds.push(sid);
+    } else {
+      const tag = target.startsWith("#") ? target.slice(1) : target;
+      victimIds = findSessionsByTag(tag);
+    }
+    if (!victimIds.length) {
+      await sock.sendMessage(jid, { text: `❌ no session matching ${target}` });
+      return;
+    }
+    const lines = [];
+    for (const sid of victimIds) {
+      const s = sessions.get(sid);
+      if (!s) continue;
+      const label = `${s.number ? `${s.number} ` : ""}[${s.tag}]`;
+      if (!s.windowId) {
+        lines.push(`⚠️ ${label} no window id known (start via !spawn to enable)`);
+        continue;
+      }
+      writeToTabTTY(s.windowId, "/clear");
+      lines.push(`🧹 ${label} cleared`);
+    }
+    await sock.sendMessage(jid, { text: lines.join("\n") });
+    return;
+  }
+
+  // !ctx [N|tag]              → context-window usage. With no arg, all
+  //                             sessions; with arg, just the matching
+  //                             one(s). Read from each session's most
+  //                             recent Claude Code transcript (% of 1M).
+  const ctxMatch = /^!(?:ctx|stats)(?:\s+(\S+))?\s*$/i.exec(text);
+  if (ctxMatch) {
+    const filter = ctxMatch[1];
+    let entries = [...sessions.entries()];
+    if (filter) {
+      if (/^\d+$/.test(filter)) {
+        const sid = numberToSessionId.get(parseInt(filter, 10));
+        entries = sid && sessions.has(sid) ? [[sid, sessions.get(sid)]] : [];
+      } else {
+        const tag = filter.startsWith("#") ? filter.slice(1) : filter;
+        const ids = findSessionsByTag(tag);
+        entries = ids.map((id) => [id, sessions.get(id)]).filter(([, s]) => s);
+      }
+    }
+    entries.sort((a, b) => (a[1].number || 99) - (b[1].number || 99));
+    if (!entries.length) {
+      await sock.sendMessage(jid, { text: filter ? `❌ no session matching ${filter}` : "no sessions registered" });
+      return;
+    }
+    const lines = ["📊 context usage"];
+    for (const [, s] of entries) {
+      const usage = readLatestUsage(s.cwd);
+      const label = `${s.number ? `${s.number} ` : ""}[${s.tag}]`;
+      if (!usage) { lines.push(`${label}  no transcript found`); continue; }
+      const total = (usage.input_tokens || 0)
+        + (usage.cache_creation_input_tokens || 0)
+        + (usage.cache_read_input_tokens || 0);
+      const pct = (total / 1_000_000 * 100).toFixed(1);
+      const k = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+      lines.push(`${label}  ${pct}%  (${k(total)} ctx · ${k(usage.output_tokens || 0)} out)`);
+    }
+    await sock.sendMessage(jid, { text: lines.join("\n") });
+    return;
+  }
+
   // Build base content + meta
   let content = text || (media ? `(${media.type})` : "(empty)");
   const meta = {
@@ -746,23 +1068,30 @@ async function handleInbound(msg, jid, participant) {
     meta.attachment_count = "1";
     meta.attachments = `${name} (${media.mimetype}, ${kb}KB)`;
   }
+  if (voiceTranscript !== null) meta.voice = "true";
+  if (voiceError) meta.voice_error = voiceError;
   if (isGroup) meta.group = "true";
 
   // 2. Routing classification
   let targets = []; // list of session IDs
   let routedBy = null;
 
-  const numMatch = /^(\d{1,2})\s+([\s\S]*)$/.exec(text);
-  const hashMatch = /^#([a-zA-Z0-9_-]+)\s+([\s\S]*)$/.exec(text);
+  // Routing prefixes — body is optional so a caption like "5" on a bare
+  // image (no text body) still routes to session 5; the attachment itself
+  // is the payload.
+  const numMatch = /^(\d{1,2})(?:\s+([\s\S]*))?$/.exec(text);
+  const hashMatch = /^#([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(text);
   const allMatch = /^!all(?:\s+([\s\S]*))?$/i.exec(text);
   const quotedId = getQuotedStanzaId(message);
+  const fallbackBody = () => media ? `(${media.type})` : "(empty)";
 
   if (numMatch) {
     const n = parseInt(numMatch[1], 10);
     if (n >= 1 && n <= 99) {
       const sid = numberToSessionId.get(n);
       if (sid && sessions.has(sid)) {
-        content = numMatch[2];
+        const body = (numMatch[2] || "").trim();
+        content = body || fallbackBody();
         targets = [sid];
         meta.route_number = String(n);
         routedBy = "number";
@@ -772,9 +1101,9 @@ async function handleInbound(msg, jid, participant) {
 
   if (!targets.length && hashMatch) {
     const tag = hashMatch[1];
-    const stripped = hashMatch[2];
+    const stripped = (hashMatch[2] || "").trim();
     targets = findSessionsByTag(tag);
-    if (targets.length) { content = stripped; meta.route_tag = tag; routedBy = "tag"; }
+    if (targets.length) { content = stripped || fallbackBody(); meta.route_tag = tag; routedBy = "tag"; }
   }
 
   if (!targets.length && allMatch) {
@@ -796,6 +1125,17 @@ async function handleInbound(msg, jid, participant) {
       targets = [sid];
       meta.route_quoted = quotedId;
       routedBy = "quoted";
+    }
+  }
+
+  // Sticky active routing: an explicit pick (<N>, #tag, or quote-reply)
+  // promotes that session to "active", so subsequent unprefixed messages
+  // — text, images, voice — keep flowing there until you switch with
+  // another <N>. Broadcast (!all) is one-shot and never sticks.
+  if (targets.length === 1 && (routedBy === "number" || routedBy === "tag" || routedBy === "quoted")) {
+    if (activeSessionId !== targets[0]) {
+      activeSessionId = targets[0];
+      log(`active session → ${activeSessionId.slice(0, 8)} (sticky from ${routedBy})`);
     }
   }
 
@@ -837,6 +1177,22 @@ async function handleInbound(msg, jid, participant) {
       meta: { ...meta, to_session: sid },
     });
   }
+
+  // Immediate ack reaction so the sender knows the daemon picked up the
+  // command and routed it (Claude itself may take a beat to reply). For
+  // single-target sends we react with the destination session's number
+  // emoji — instant visual confirmation of WHO got it. Broadcast → 📣.
+  const NUM_EMOJI = ["0️⃣","1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
+  let ackEmoji;
+  if (routedBy === "broadcast") {
+    ackEmoji = "📣";
+  } else if (targets.length === 1) {
+    const n = sessions.get(targets[0])?.number;
+    ackEmoji = (n != null && n <= 10) ? NUM_EMOJI[n] : "👀";
+  } else {
+    ackEmoji = "👀";
+  }
+  try { await sock.sendMessage(jid, { react: { text: ackEmoji, key: msg.key } }); } catch {}
 }
 
 // ── Outbound: permission request (Claude → WhatsApp) ────────────────
@@ -910,6 +1266,45 @@ async function handleReply(sessionId, { chat_id, text, reply_to, files }) {
 async function handleReact(sessionId, { chat_id, message_id, emoji }) {
   if (!sock || !connectionReady) throw new Error("WhatsApp not connected");
   await sock.sendMessage(chat_id, { react: { text: emoji, key: { remoteJid: chat_id, id: message_id } } });
+  return { ok: true };
+}
+
+// Rolling progress messages: per (sessionId, chatId), keep one editable
+// status message that successive progress() calls append to. State drops
+// after PROGRESS_TTL idle so old keys don't pile up indefinitely.
+const progressMessages = new Map(); // `${sid}:${chatId}` → { key, lines: [], ts }
+const PROGRESS_TTL = 30 * 60 * 1000;
+
+async function handleProgress(sessionId, { chat_id, text, reset }) {
+  if (!sock || !connectionReady) throw new Error("WhatsApp not connected");
+  if (!chat_id || !text) throw new Error("chat_id and text required");
+  const session = sessions.get(sessionId);
+  const tagPrefix = session ? `[${session.number ? `${session.number} ` : ""}${session.tag}] ` : "";
+  const k = `${sessionId}:${chat_id}`;
+  let state = progressMessages.get(k);
+  if (state && Date.now() - state.ts > PROGRESS_TTL) state = null;
+  if (reset) state = null;
+
+  if (!state) {
+    const sent = await sock.sendMessage(chat_id, { text: `${tagPrefix}${text}` });
+    progressMessages.set(k, { key: sent?.key, lines: [text], ts: Date.now() });
+  } else {
+    state.lines.push(text);
+    state.ts = Date.now();
+    if (state.key) {
+      try {
+        await sock.sendMessage(chat_id, {
+          text: `${tagPrefix}${state.lines.join("\n")}`,
+          edit: state.key,
+        });
+      } catch (e) {
+        // Edit failed (msg too old, etc.) — start a fresh status message.
+        log(`progress edit failed, sending new: ${e.message || e}`);
+        const sent = await sock.sendMessage(chat_id, { text: `${tagPrefix}${text}` });
+        progressMessages.set(k, { key: sent?.key, lines: [text], ts: Date.now() });
+      }
+    }
+  }
   return { ok: true };
 }
 
@@ -1038,6 +1433,14 @@ async function handleFrame(clientSock, line) {
       } catch (e) { err(clientSock, reqId, e.message || e); }
       return;
     }
+    case "progress": {
+      try {
+        const sid = frame.from_session || socketToSession.get(clientSock);
+        const data = await handleProgress(sid, frame);
+        ack(clientSock, reqId, data);
+      } catch (e) { err(clientSock, reqId, e.message || e); }
+      return;
+    }
     case "download_attachment": {
       try {
         const data = await handleDownload(frame);
@@ -1102,10 +1505,43 @@ setInterval(() => {
   try { fs.accessSync(PANIC_FILE); log("PANIC file present — shutting down"); shutdown(); } catch {}
 }, 5000).unref();
 
+// On daemon startup, ping every registered session for a one-line
+// status — same behavior as a phone-side `!all` — so the user can see
+// what's alive after a restart. Fired once 10s after main() so existing
+// session-clients have a chance to reconnect first.
+function broadcastStartupStatus() {
+  const access = loadAccess();
+  const phone = access.allowFrom?.[0];
+  if (!phone) { log("startup status: no allowFrom phone configured, skipping"); return; }
+  const chatId = toJid(phone);
+  let n = 0;
+  for (const [sid, s] of sessions) {
+    if (!s.socket) continue;
+    sendFrame(s.socket, {
+      op: "inbound",
+      to_session: sid,
+      content: "Status check: reply with ONE short line describing what you are working on right now. Nothing else.",
+      meta: {
+        chat_id: chatId,
+        message_id: `daemon-startup-${Date.now()}-${sid.slice(0, 4)}`,
+        user: phone,
+        ts: new Date().toISOString(),
+        origin: "whatsapp",
+        status_request: "true",
+        route_broadcast: "true",
+        to_session: sid,
+      },
+    });
+    n++;
+  }
+  log(`broadcast daemon-startup status request to ${n} session(s)`);
+}
+
 async function main() {
   acquirePidLock();
   startIpcServer();
   await connectWhatsApp();
+  setTimeout(broadcastStartupStatus, 10000);
 }
 
 main().catch((e) => { log(`fatal: ${e}`); process.exit(1); });

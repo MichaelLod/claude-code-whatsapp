@@ -10,3 +10,8 @@ package-lock.json
 .mcp.json
 # Session handover notes — not meant to ship
 HANDOVER.md
+
+# Local secrets (OpenAI key for voice transcription, etc.)
+.env
+.env.local
+.env.*.local
